@@ -10,7 +10,34 @@ from healer import (
     rollback_deployment, heal_pod, monitor_and_heal,
     PodStatus
 )
-from llm import diagnose_pod, check_ollama
+from llm import diagnose_pod, check_ollama, recommend_action, HealRecommendation
+
+
+class _LLMAdapter:
+    """Adapts the module-level recommend_action function to the LLMClient protocol."""
+
+    def __init__(self, ollama_url: str = "http://localhost:11434",
+                 model: str = "llama3.2"):
+        self.ollama_url = ollama_url
+        self.model = model
+
+    def recommend_action(
+        self,
+        pod_name: str,
+        namespace: str,
+        restart_count: int,
+        last_termination_reason: str,
+        recent_events: list[dict],
+    ) -> HealRecommendation:
+        return recommend_action(
+            pod_name=pod_name,
+            namespace=namespace,
+            restart_count=restart_count,
+            last_termination_reason=last_termination_reason,
+            recent_events=recent_events,
+            ollama_url=self.ollama_url,
+            model=self.model,
+        )
 
 
 def main():
@@ -23,7 +50,9 @@ Examples:
   %(prog)s scan -n production            # Specify namespace
   %(prog)s heal my-pod                   # Heal specific pod
   %(prog)s heal my-pod --force           # Force restart
+  %(prog)s heal my-pod --ai              # AI-guided healing
   %(prog)s monitor                       # Continuous monitoring
+  %(prog)s monitor --ai --interval 60    # AI-guided monitoring
   %(prog)s diagnose my-pod               # AI diagnosis
         """,
     )
@@ -41,6 +70,8 @@ Examples:
                             help="Kubernetes namespace")
     heal_parser.add_argument("--force", action="store_true",
                             help="Force restart even if not critical")
+    heal_parser.add_argument("--ai", action="store_true",
+                            help="Use AI to diagnose before healing")
 
     # Monitor command
     monitor_parser = subparsers.add_parser("monitor", help="Continuous monitoring")
@@ -50,6 +81,12 @@ Examples:
                                help="Check interval in seconds")
     monitor_parser.add_argument("--max-heals", type=int, default=10,
                                help="Maximum heals before stopping")
+    monitor_parser.add_argument("--ai", action="store_true",
+                               help="Use AI to diagnose before healing")
+    monitor_parser.add_argument("--cooldown", type=int, default=300,
+                               help="Per-pod cooldown in seconds")
+    monitor_parser.add_argument("--max-heals-per-pod", type=int, default=3,
+                               help="Max heals for a single pod")
 
     # Diagnose command
     diagnose_parser = subparsers.add_parser("diagnose", help="AI diagnosis")
@@ -79,6 +116,22 @@ Examples:
         _handle_diagnose(args)
 
 
+def _build_llm_client(args) -> _LLMAdapter | None:
+    """Build an LLM adapter if --ai was requested, else None."""
+    if not getattr(args, "ai", False):
+        return None
+
+    # Quick connectivity check
+    if not check_ollama(args.ollama_url):
+        if not os.environ.get("OPENAI_API_KEY"):
+            print("Warning: Neither Ollama nor OPENAI_API_KEY available. "
+                  "Falling back to threshold logic.", file=sys.stderr)
+            return None
+
+    print("AI diagnosis: enabled")
+    return _LLMAdapter(ollama_url=args.ollama_url, model=args.model)
+
+
 def _handle_scan(args):
     """Handle scan command."""
     print(f"Scanning namespace: {args.namespace}")
@@ -87,7 +140,7 @@ def _handle_scan(args):
     pods = get_problematic_pods(args.namespace)
 
     if not pods:
-        print("✓ No problematic pods found")
+        print("No problematic pods found")
         return
 
     print(f"Found {len(pods)} problematic pods:")
@@ -118,17 +171,22 @@ def _handle_heal(args):
     print(f"  Restarts: {pod.restart_count}")
     print()
 
+    # Build LLM client if requested
+    llm_client = _build_llm_client(args)
+
     # Attempt healing
-    action = heal_pod(pod, force_restart=args.force)
+    action = heal_pod(pod, force_restart=args.force, llm_client=llm_client)
 
     if action.success:
-        print(f"✓ {action.action}: {action.message}")
+        print(f"  {action.action}: {action.message}")
     else:
-        print(f"✗ Failed: {action.message}")
+        print(f"  Failed: {action.message}")
 
 
 def _handle_monitor(args):
     """Handle monitor command."""
+    llm_client = _build_llm_client(args)
+
     print("Starting continuous monitoring...")
     print("Press Ctrl+C to stop")
     print()
@@ -138,6 +196,9 @@ def _handle_monitor(args):
             namespace=args.namespace,
             interval=args.interval,
             max_heals=args.max_heals,
+            llm_client=llm_client,
+            cooldown_seconds=args.cooldown,
+            max_heals_per_pod=args.max_heals_per_pod,
         )
 
         print("\nMonitoring complete:")
